@@ -635,11 +635,75 @@ func TestMaxRetries(t *testing.T) {
 	})
 
 	_, err := cl.Embed([]string{"input1", "input2"}, "test-model", nil)
-	if err != nil {
-		t.Fatal(err.Error())
+	if err == nil {
+		t.Fatal("Expected an error after exhausting retries, got nil")
 	}
 
 	if retries != maxRetries {
 		t.Errorf("Expected retries to equal %d but got %d", maxRetries, retries)
+	}
+}
+
+func TestNoRetryOnSuccess(t *testing.T) {
+	requests := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+
+		var req voyageai.EmbeddingRequest
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal("Could not read request body")
+		}
+
+		err = json.Unmarshal(b, &req)
+		if err != nil {
+			t.Fatalf("Invalid request body")
+		}
+		resp := voyageai.EmbeddingResponse{
+			Object: "list",
+			Data: []voyageai.EmbeddingObject{
+				{
+					Object:    "embedding",
+					Embedding: []float32{0.1, 0.2, 0.3},
+					Index:     0,
+				},
+				{
+					Object:    "embedding",
+					Embedding: []float32{0.4, 0.5, 0.6},
+					Index:     1,
+				},
+			},
+			Model: req.Model,
+			Usage: voyageai.UsageObject{
+				TotalTokens: 10,
+			},
+		}
+
+		respb, err := json.Marshal(&resp)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+
+		// Status code of 200 on the first attempt should not trigger a retry.
+		w.WriteHeader(200)
+		w.Write(respb)
+	}))
+	defer s.Close()
+
+	maxRetries := rand.Intn(10) + 2
+	cl := voyageai.NewClient(&voyageai.VoyageClientOpts{
+		Key:        "APIKEY",
+		TimeOut:    1500,
+		MaxRetries: maxRetries,
+		BaseURL:    s.URL,
+	})
+
+	_, err := cl.Embed([]string{"input1", "input2"}, "test-model", nil)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	if requests != 1 {
+		t.Errorf("Expected exactly 1 request on success but got %d", requests)
 	}
 }
