@@ -1,2 +1,16 @@
 cover.out
 .env
+
+# AI agent / tool files
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+GEMINI.md
+.gemini/
+.codex/
+.cursorrules
+.cursor/
+.windsurfrules
+.clinerules/
+.aider*
