@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/austinfhunter/voyageai"
 )
@@ -628,10 +629,11 @@ func TestMaxRetries(t *testing.T) {
 
 	maxRetries := rand.Intn(10) + 1
 	cl := voyageai.NewClient(&voyageai.VoyageClientOpts{
-		Key:        "APIKEY",
-		TimeOut:    1500,
-		MaxRetries: maxRetries,
-		BaseURL:    s.URL,
+		Key:            "APIKEY",
+		TimeOut:        1500,
+		MaxRetries:     maxRetries,
+		BaseURL:        s.URL,
+		RetryBaseDelay: time.Millisecond,
 	})
 
 	_, err := cl.Embed([]string{"input1", "input2"}, "test-model", nil)
@@ -692,10 +694,11 @@ func TestNoRetryOnSuccess(t *testing.T) {
 
 	maxRetries := rand.Intn(10) + 2
 	cl := voyageai.NewClient(&voyageai.VoyageClientOpts{
-		Key:        "APIKEY",
-		TimeOut:    1500,
-		MaxRetries: maxRetries,
-		BaseURL:    s.URL,
+		Key:            "APIKEY",
+		TimeOut:        1500,
+		MaxRetries:     maxRetries,
+		BaseURL:        s.URL,
+		RetryBaseDelay: time.Millisecond,
 	})
 
 	_, err := cl.Embed([]string{"input1", "input2"}, "test-model", nil)
@@ -705,5 +708,77 @@ func TestNoRetryOnSuccess(t *testing.T) {
 
 	if requests != 1 {
 		t.Errorf("Expected exactly 1 request on success but got %d", requests)
+	}
+}
+
+func TestRetryBackoffDelaysRetries(t *testing.T) {
+	requests := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests < 3 {
+			w.WriteHeader(500)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{"object":"list","data":[],"model":"test-model","usage":{"total_tokens":0}}`))
+	}))
+	defer s.Close()
+
+	cl := voyageai.NewClient(&voyageai.VoyageClientOpts{
+		Key:            "APIKEY",
+		TimeOut:        1500,
+		MaxRetries:     3,
+		BaseURL:        s.URL,
+		RetryBaseDelay: 10 * time.Millisecond,
+	})
+
+	start := time.Now()
+	_, err := cl.Embed([]string{"input1"}, "test-model", nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	if elapsed < 25*time.Millisecond {
+		t.Errorf("Expected backoff of at least 25ms (10ms + 20ms), got %s", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Expected backoff well under 2s, got %s", elapsed)
+	}
+}
+
+func TestRetryHonorsRetryAfterHeader(t *testing.T) {
+	requests := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", "1")
+			b, _ := json.Marshal(voyageai.APIError{Detail: "rate limited"})
+			w.WriteHeader(429)
+			w.Write(b)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{"object":"list","data":[],"model":"test-model","usage":{"total_tokens":0}}`))
+	}))
+	defer s.Close()
+
+	cl := voyageai.NewClient(&voyageai.VoyageClientOpts{
+		Key:            "APIKEY",
+		TimeOut:        3000,
+		MaxRetries:     2,
+		BaseURL:        s.URL,
+		RetryBaseDelay: time.Millisecond,
+	})
+
+	start := time.Now()
+	_, err := cl.Embed([]string{"input1"}, "test-model", nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	if elapsed < 900*time.Millisecond {
+		t.Errorf("Expected Retry-After of ~1s to be honored, but only waited %s", elapsed)
 	}
 }
