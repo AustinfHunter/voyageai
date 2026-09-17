@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -20,10 +21,11 @@ type VoyageClient struct {
 
 // Optional arguments for the client configuration.
 type VoyageClientOpts struct {
-	Key        string // A Voyage AI API key
-	TimeOut    int    // The timeout for all client requests, in milliseconds. No timeout is set by default.
-	MaxRetries int    // The maximum number of retries. Requests will not be retried by default.
-	BaseURL    string // The BaseURL for the API. Defaults to the Voyage AI API but can be changed for testing and/or mocking.
+	Key            string        // A Voyage AI API key
+	TimeOut        int           // The timeout for all client requests, in milliseconds. No timeout is set by default.
+	MaxRetries     int           // The maximum number of retries. Requests will not be retried by default.
+	BaseURL        string        // The BaseURL for the API. Defaults to the Voyage AI API but can be changed for testing and/or mocking.
+	RetryBaseDelay time.Duration // The base delay between retries, doubled on each subsequent retry. Defaults to 500ms. Ignored for a retry when the response carries a Retry-After header.
 }
 
 // Returns a pointer to the given input. Useful when creating [EmbeddingRequestOpts], [MultimodalRequestOpts], and [RerankRequestOpts] literals.
@@ -99,48 +101,90 @@ func (c *VoyageClient) handleAPIError(resp *http.Response) (bool, error) {
 	}
 }
 
+func (c *VoyageClient) doRequest(bb []byte, url string) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bb))
+	if err != nil {
+		return nil, err
+	}
+	return c.do(req)
+}
+
+// handleResponse consumes and closes resp.Body before returning, so callers must not
+// touch resp.Body afterward.
+func (c *VoyageClient) handleResponse(resp *http.Response, respBody any) (bool, time.Duration, error) {
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode >= 400 {
+		cont, err := c.handleAPIError(resp)
+		return cont, retryAfterDuration(resp), err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, 0, err
+	}
+
+	if err := json.Unmarshal(body, respBody); err != nil {
+		return false, 0, err
+	}
+
+	return false, 0, nil
+}
+
+func retryAfterDuration(resp *http.Response) time.Duration {
+	v := resp.Header.Get("Retry-After")
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 func (c *VoyageClient) handleAPIRequest(reqBody any, respBody any, url string) error {
 	if c.opts.MaxRetries == 0 {
 		c.opts.MaxRetries = 1
 	}
 
+	baseDelay := c.opts.RetryBaseDelay
+	if baseDelay == 0 {
+		baseDelay = 500 * time.Millisecond
+	}
+
+	bb, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
 	var lastErr error
-	for range c.opts.MaxRetries {
-		bb, err := json.Marshal(reqBody)
+	for attempt := range c.opts.MaxRetries {
+		resp, err := c.doRequest(bb, url)
 		if err != nil {
 			return err
 		}
 
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(bb))
-		if err != nil {
+		cont, retryAfter, err := c.handleResponse(resp, respBody)
+		if !cont {
 			return err
 		}
+		lastErr = err
 
-		resp, err := c.do(req)
-		if err != nil {
-			return err
-		}
-
-		if resp.StatusCode >= 400 {
-			cont, err := c.handleAPIError(resp)
-			if !cont {
-				return err
+		if attempt < c.opts.MaxRetries-1 {
+			delay := retryAfter
+			if delay == 0 {
+				delay = baseDelay * time.Duration(1<<attempt)
 			}
-			lastErr = err
-			continue
+			time.Sleep(delay)
 		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-
-		err = json.Unmarshal(body, respBody)
-		if err != nil {
-			return err
-		}
-
-		return nil
 	}
 
 	return lastErr
